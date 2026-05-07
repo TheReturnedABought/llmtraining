@@ -4,6 +4,7 @@ import time
 import argparse
 import signal
 import sys
+from pathlib import Path
 from datetime import datetime
 from model import WorldModel
 from config import ModelConfig
@@ -118,9 +119,42 @@ global_step = 0
 start_epoch = 0
 best_val_loss = float('inf')
 
+def resolve_resume_path(resume_path: str):
+    """Resolve checkpoint path across different launch directories."""
+    candidate = Path(resume_path).expanduser()
+    if candidate.is_file():
+        return candidate
+
+    script_dir = Path(__file__).resolve().parent
+    candidate_from_script = script_dir / candidate
+    if candidate_from_script.is_file():
+        return candidate_from_script
+
+    if not candidate.is_absolute():
+        checkpoint_dir = Path(args.checkpoint_dir).expanduser()
+        if not checkpoint_dir.is_absolute():
+            checkpoint_dir = script_dir / checkpoint_dir
+        candidate_from_checkpoint_dir = checkpoint_dir / candidate.name
+        if candidate_from_checkpoint_dir.is_file():
+            return candidate_from_checkpoint_dir
+
+    return None
+
 if args.resume is not None:
-    print(f"📂 Resuming from {args.resume}")
-    ckpt = torch.load(args.resume, map_location=device)
+    resolved_resume = resolve_resume_path(args.resume)
+    if resolved_resume is None:
+        script_dir = Path(__file__).resolve().parent
+        checkpoint_dir = Path(args.checkpoint_dir).expanduser()
+        if not checkpoint_dir.is_absolute():
+            checkpoint_dir = script_dir / checkpoint_dir
+        print(f"❌ Could not find checkpoint: {args.resume}")
+        print(f"   Tried relative to CWD   : {Path.cwd()}")
+        print(f"   Tried relative to script: {script_dir}")
+        print(f"   Tried checkpoint dir    : {checkpoint_dir}")
+        sys.exit(1)
+
+    print(f"📂 Resuming from {resolved_resume}")
+    ckpt = torch.load(str(resolved_resume), map_location=device)
     model.load_state_dict(ckpt["model"])
     opt.load_state_dict(ckpt["optimizer"])
     global_step = ckpt.get("global_step", 0)
