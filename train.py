@@ -38,6 +38,8 @@ parser.add_argument("--wandb", action="store_true")
 parser.add_argument("--project", type=str, default="world-model")
 parser.add_argument("--checkpoint_dir", type=str, default="checkpoints")
 parser.add_argument("--eval_every", type=int, default=500)
+parser.add_argument("--eval_batches", type=int, default=64, help="Validation batches per eval (0 = full validation set)")
+parser.add_argument("--sample_tokens", type=int, default=80, help="Tokens to generate for quick eval sample")
 parser.add_argument("--log_every", type=int, default=100)
 parser.add_argument("--seed", type=int, default=42)
 args = parser.parse_args()
@@ -46,7 +48,8 @@ args = parser.parse_args()
 # Setup
 # ─────────────────────────────
 torch.manual_seed(args.seed)
-device = "cuda" if torch.cuda.is_available() else "cpu"
+cuda_available = torch.cuda.is_available()
+device = "cuda" if cuda_available else "cpu"
 os.makedirs(args.checkpoint_dir, exist_ok=True)
 
 cfg = ModelConfig(
@@ -67,6 +70,10 @@ print("🚀 NextLat Mini Pipeline — Initialization Report")
 print("=" * 60)
 print(f"📅 Timestamp    : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print(f"💻 Device       : {device.upper()}")
+if not cuda_available:
+    print("⚠️  CUDA unavailable — running on CPU. If you expected GPU, install a CUDA-enabled PyTorch build.")
+else:
+    print(f"🎮 GPU          : {torch.cuda.get_device_name(0)}")
 print(f"🧠 Model params : {sum(p.numel() for p in model.parameters()):,}")
 print(f"📦 Trainable    : {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
@@ -95,7 +102,9 @@ print(f"   ├─ Max epochs   : {args.epochs}")
 print(f"   ├─ Learning rate: {args.lr}")
 print(f"   ├─ Lambda_h     : {args.lambda_h}")
 print(f"   ├─ Lambda_kl    : {args.lambda_kl}")
-print(f"   └─ KL warmup    : {args.kl_warmup} steps")
+print(f"   ├─ KL warmup    : {args.kl_warmup} steps")
+print(f"   ├─ Eval batches : {args.eval_batches if args.eval_batches else 'full'}")
+print(f"   └─ Sample tokens: {args.sample_tokens}")
 print(f"\n📊 Dataset:")
 print(f"   ├─ Train batches: {len(train_loader)}")
 print(f"   ├─ Val batches  : {len(val_loader)}")
@@ -140,12 +149,14 @@ def get_kl_weight(step):
 # ─────────────────────────────
 # Training Utilities
 # ─────────────────────────────
-def evaluate():
+def evaluate(max_batches=0):
     model.eval()
     total_loss = 0.0
     n = 0
     with torch.no_grad():
-        for x, y in val_loader:
+        for i, (x, y) in enumerate(val_loader):
+            if max_batches and i >= max_batches:
+                break
             x, y = x.to(device), y.to(device)
             # Use full KL weight for consistent eval
             _, loss, _ = model(x, y, lambda_h=args.lambda_h, lambda_kl=args.lambda_kl)
@@ -155,10 +166,11 @@ def evaluate():
     return total_loss / max(n, 1)
 
 
-def sample(prompt="The", max_new=200):
+def sample(prompt="The", max_new=80):
     model.eval()
-    tokens = [prompt.encode("utf-8", errors="replace")]
-    idx = torch.tensor(tokens, dtype=torch.long).to(device)
+    prompt_bytes = prompt.encode("utf-8", errors="replace")
+    tokens = list(prompt_bytes)
+    idx = torch.tensor([tokens], dtype=torch.long).to(device)
     with torch.no_grad():
         for _ in range(max_new):
             logits, _, _ = model(idx)
@@ -284,14 +296,14 @@ for epoch in range(start_epoch, args.epochs):
             print(f"\n{'=' * 60}")
             print(f"📊 Evaluating at step {global_step}...")
             val_start = time.time()
-            val_loss = evaluate()
+            val_loss = evaluate(args.eval_batches)
             val_time = time.time() - val_start
             print(f"📊 Eval done in {val_time:.1f}s — val_loss: {val_loss:.4f}")
             print(f"{'=' * 60}")
 
             # Quick sample
             print("\n--- Sample ---")
-            print(sample("The history of"))
+            print(sample("The history of", max_new=args.sample_tokens))
             print("--------------\n")
 
             is_best = val_loss < best_val_loss
