@@ -89,7 +89,7 @@ try:
     train_batches = len(train_loader)
     val_batches = len(val_loader)
 except BaseException as e:
-    print(f"❌ Failed to build data loaders: {e}")
+    print(f"FAILED to build data loaders: {e}", flush=True)
     print("   Make sure dependencies are installed: pip install torch datasets numpy")
     print("   If cache may be corrupted, delete: data_cache_wikipedia_en.bin and data_cache_wikipedia_en.bin.len")
     traceback.print_exc()
