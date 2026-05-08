@@ -1,3 +1,6 @@
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
 import torch
 import os
 import time
@@ -6,9 +9,10 @@ import signal
 import sys
 import math
 import traceback
+import contextlib
 from pathlib import Path
 from datetime import datetime
-from model import WorldModel
+from model import WorldModel, _HAS_EFFICIENT_ATTN
 from config import ModelConfig
 from data import get_loaders, decode
 
@@ -30,13 +34,14 @@ signal.signal(signal.SIGINT, signal_handler)
 # Argument Parser
 # ─────────────────────────────
 parser = argparse.ArgumentParser(description="Train NextLat Mini Pipeline")
-parser.add_argument("--batch_size", type=int, default=128)
+parser.add_argument("--batch_size", type=int, default=None,
+                    help="Batch size (default: from config.py)")
 parser.add_argument("--steps", type=int, default=100000)
 parser.add_argument("--epochs", type=int, default=10, help="Max epochs")
 parser.add_argument("--lr", type=float, default=3e-4)
 parser.add_argument("--min_lr", type=float, default=1e-5, help="Minimum learning rate for cosine schedule")
-parser.add_argument("--lambda_h", type=float, default=0.1)
-parser.add_argument("--lambda_kl", type=float, default=0.0005, help="KL weight (reduced from 0.01)")
+parser.add_argument("--lambda_h", type=float, default=0.01)
+parser.add_argument("--lambda_kl", type=float, default=0.00005, help="KL weight (reduced from 0.01)")
 parser.add_argument("--kl_warmup", type=int, default=5000, help="Steps to linearly ramp up KL weight")
 parser.add_argument("--kl_temp", type=float, default=0.5, help="KL temperature (lower = less collapse)")
 parser.add_argument("--kl_free_bits", type=float, default=0.7, help="Free bits for KL to prevent collapse")
@@ -55,15 +60,23 @@ parser.add_argument("--grad_clip", type=float, default=1.0)
 parser.add_argument("--weight_decay", type=float, default=0.01)
 parser.add_argument("--beta1", type=float, default=0.9)
 parser.add_argument("--beta2", type=float, default=0.95)
-parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
+parser.add_argument("--num_workers", type=int, default=None,
+                    help="DataLoader workers (default: from config.py)")
+# ── Speed / VRAM ──────────────────────────────────────────────────────────────
+parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                    help="torch.compile the model (~20-50%% speedup, slow first step) [default: on]")
+parser.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True,
+                    help="BF16 mixed precision (Ampere+ GPUs, halves activation VRAM) [default: on]")
+parser.add_argument("--grad_accum", type=int, default=None,
+                    help="Gradient accumulation steps (default: from config.py)")
+parser.add_argument("--grad_checkpoint", action="store_true",
+                    help="Gradient checkpointing (saves ~60%% VRAM at ~30%% speed cost) [default: off]")
 args = parser.parse_args()
 
 # ─────────────────────────────
 # Setup
 # ─────────────────────────────
 torch.manual_seed(args.seed)
-cuda_available = torch.cuda.is_available()
-device = "cuda" if cuda_available else "cpu"
 os.makedirs(args.checkpoint_dir, exist_ok=True)
 
 cfg = ModelConfig(
@@ -73,16 +86,26 @@ cfg = ModelConfig(
     kl_anneal_type=args.kl_anneal_type,
 )
 
-model = WorldModel(cfg).to(device)
+# CLI overrides win; otherwise fall back to config.py defaults
+if args.batch_size is None:
+    args.batch_size = cfg.batch_size
+if args.grad_accum is None:
+    args.grad_accum = cfg.grad_accum
+if args.num_workers is None:
+    args.num_workers = cfg.num_workers
 
-# Configure optimizer with weight decay
-opt = torch.optim.AdamW(
-    model.parameters(),
-    lr=args.lr,
-    betas=(args.beta1, args.beta2),
-    weight_decay=args.weight_decay
-)
+# Windows: DataLoader workers use 'spawn', which re-imports train.py as __main__,
+# re-executing the full script and crashing. Force 0 on Windows automatically.
+if sys.platform == "win32" and args.num_workers > 0:
+    print(f"⚠️  num_workers={args.num_workers} not supported on Windows (spawn limitation). "
+          f"Using 0. Set num_workers>0 in config.py only when running on Linux/WSL.")
+    args.num_workers = 0
 
+# ── Load data BEFORE any CUDA init ────────────────────────────────────────────
+# torch.cuda.is_available() initializes the CUDA runtime on Windows.
+# pyarrow (used by datasets) crashes with a 0xC0000005 access violation when
+# its C extensions are imported AFTER CUDA memory is already initialized.
+# Solution: build/load the data cache first (pure CPU/numpy), then init CUDA.
 print("📚 Preparing datasets and data loaders...", flush=True)
 try:
     train_loader, val_loader = get_loaders(cfg.block_size, args.batch_size, num_workers=args.num_workers)
@@ -96,6 +119,67 @@ except BaseException as e:
     sys.exit(1)
 
 print(f"✅ Data loaders ready | train batches: {train_batches} | val batches: {val_batches}", flush=True)
+
+# ── CUDA + model init (safe: datasets/pyarrow already imported above) ─────────
+cuda_available = torch.cuda.is_available()
+device = "cuda" if cuda_available else "cpu"
+
+if cuda_available:
+    torch.backends.cudnn.benchmark = True   # safe: all inputs are fixed size
+
+model = WorldModel(cfg).to(device)
+
+# Gradient checkpointing (saves ~60% VRAM, ~30% slower)
+if args.grad_checkpoint:
+    model.use_checkpoint = True
+    print("🗜️  Gradient checkpointing enabled")
+
+# Optimizer: 8-bit AdamW saves ~75% optimizer VRAM (2×fp32 → 2×int8 states).
+# Falls back to fused AdamW (still fast, no extra install needed).
+_opt_8bit = False
+try:
+    import bitsandbytes as bnb
+    opt = bnb.optim.AdamW8bit(
+        model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay,
+    )
+    _opt_8bit = True
+except (ImportError, Exception):
+    opt = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        weight_decay=args.weight_decay,
+        fused=cuda_available,   # free ~10% speed boost
+    )
+
+# torch.compile (~20-50% speedup; requires Triton — Linux/WSL2 only)
+def _triton_available():
+    try:
+        import triton  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+_compile_active = False
+if args.compile:
+    if _triton_available():
+        print("🔧 Compiling model with torch.compile (first step will be slow)...", flush=True)
+        model = torch.compile(model, mode="reduce-overhead")
+        _compile_active = True
+    else:
+        print("⚠️  torch.compile skipped: Triton is not available on Windows.")
+        print("   Run under WSL2 for the full ~20-50% speedup, or use --no-compile to suppress.")
+
+# BF16 autocast context (Ampere+ only; halves activation VRAM, big tensor-core speedup)
+if args.bf16 and cuda_available:
+    autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    print("⚡ BF16 mixed precision enabled")
+else:
+    autocast_ctx = contextlib.nullcontext()
+
 
 if train_batches == 0:
     print("❌ Training dataset produced zero batches.")
@@ -140,9 +224,16 @@ print(f"   ├─ Vocab size   : {cfg.vocab_size}")
 print(f"   ├─ Latent steps : {cfg.latent_steps}")
 print(f"   ├─ KL temp      : {cfg.kl_temp}")
 print(f"   ├─ KL free bits : {cfg.kl_free_bits}")
-print(f"   └─ KL anneal    : {cfg.kl_anneal_type}")
+print(f"   ├─ KL anneal    : {cfg.kl_anneal_type}")
+_swa_w = getattr(cfg, 'swa_window', 256)
+_attn_pattern = " + ".join(
+    ["global" if i == cfg.n_layer - 1 else f"SWA(W={_swa_w})" for i in range(cfg.n_layer)]
+)
+print(f"   ├─ Attention    : {_attn_pattern}")
+print(f"   └─ RoPE base    : 500,000")
 print(f"\n📈 Training Config:")
 print(f"   ├─ Batch size   : {args.batch_size}")
+print(f"   ├─ Grad accum   : {args.grad_accum}x  (effective batch: {args.batch_size * args.grad_accum})")
 print(f"   ├─ Max steps    : {args.steps:,}")
 print(f"   ├─ Max epochs   : {args.epochs}")
 print(f"   ├─ Learning rate: {args.lr}")
@@ -155,6 +246,13 @@ print(f"   ├─ Grad clip    : {args.grad_clip}")
 print(f"   ├─ Eval batches : {args.eval_batches if args.eval_batches else 'full'}")
 print(f"   ├─ Num workers  : {args.num_workers}")
 print(f"   └─ Sample tokens: {args.sample_tokens}")
+print(f"\n🚀 Speed / VRAM:")
+print(f"   ├─ BF16         : {'on' if args.bf16 and cuda_available else 'off'}")
+print(f"   ├─ torch.compile: {'on' if _compile_active else 'off (Triton unavailable on Windows)' if args.compile else 'off'}")
+print(f"   ├─ grad_ckpt    : {'on' if args.grad_checkpoint else 'off'}")
+print(f"   ├─ Optimizer    : {'8-bit AdamW (bitsandbytes)' if _opt_8bit else 'AdamW (fused)' if cuda_available else 'AdamW'}")
+_attn_backend = 'Flash Attn-2 (global) + Efficient Attn (SWA)' if _HAS_EFFICIENT_ATTN else 'math (upgrade PyTorch ≥2.3 for FA-2)'
+print(f"   └─ Attn backend : {_attn_backend}")
 print(f"\n📊 Dataset:")
 print(f"   ├─ Train batches: {train_batches}")
 print(f"   ├─ Val batches  : {val_batches}")
@@ -382,7 +480,8 @@ def evaluate(max_batches=0):
             if max_batches and i >= max_batches:
                 break
             x, y = x.to(device), y.to(device)
-            _, loss, logs = model(x, y, lambda_h=args.lambda_h, lambda_kl=args.lambda_kl)
+            with autocast_ctx:
+                _, loss, logs = model(x, y, lambda_h=args.lambda_h, lambda_kl=args.lambda_kl)
             total_loss += loss.item()
             total_kl += logs.get('kl', 0)
             n += 1
@@ -485,7 +584,8 @@ def save_checkpoint(step, epoch, is_best=False, is_progress=False):
 # ─────────────────────────────
 # Main Training Loop
 # ─────────────────────────────
-tokens_per_step = args.batch_size * cfg.block_size
+tokens_per_step = args.batch_size * cfg.block_size          # per micro-step
+tokens_per_opt_step = tokens_per_step * args.grad_accum    # per optimizer step
 total_tokens = 0
 t0 = time.time()
 step_times = []
@@ -508,60 +608,75 @@ for epoch in range(current_epoch, args.epochs):
     epoch_kl_loss = 0.0
     epoch_steps = 0
 
+    micro_step = 0      # counts forward passes within current epoch
+    micro_logs = {}     # accumulates logs across grad_accum micro-steps
+    opt.zero_grad(set_to_none=True)
+    t_accum_start = time.time()
+
     # Data iterator
     for x, y in train_loader:
         if global_step >= args.steps or interrupted:
             break
 
-        step_start = time.time()
+        x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
-        x, y = x.to(device), y.to(device)
-
-        # Update learning rate
+        # Update LR and KL weight (computed per optimizer step, used for all micro-steps)
         current_lr = get_lr(global_step, total_possible_steps)
-        for param_group in opt.param_groups:
-            param_group['lr'] = current_lr
-
-        # Get current KL weight from warmup schedule
         current_kl_weight = get_kl_weight(global_step)
 
-        # Forward pass
-        _, loss, logs = model(
-            x, y,
-            lambda_h=args.lambda_h,
-            lambda_kl=current_kl_weight,
-        )
+        # Forward pass (with optional BF16 autocast)
+        with autocast_ctx:
+            _, loss, logs = model(
+                x, y,
+                lambda_h=args.lambda_h,
+                lambda_kl=current_kl_weight,
+            )
 
         # Check for NaN loss
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"⚠️  NaN/Inf loss detected at step {global_step}. Skipping batch.")
             continue
 
-        # Backward pass
-        opt.zero_grad()
-        loss.backward()
+        # Scaled backward (accumulate gradients)
+        (loss / args.grad_accum).backward()
+        micro_step += 1
 
-        # Gradient clipping
+        # Accumulate logs (averaged across micro-steps)
+        for k, v in logs.items():
+            micro_logs[k] = micro_logs.get(k, 0.0) + v / args.grad_accum
+
+        # Only run optimizer step every grad_accum micro-steps
+        if micro_step % args.grad_accum != 0:
+            continue
+
+        # ── Optimizer step ──────────────────────────────────────────────────
+        for param_group in opt.param_groups:
+            param_group['lr'] = current_lr
+
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-
-        # Optimizer step
         opt.step()
+        opt.zero_grad(set_to_none=True)
 
         global_step += 1
-        total_tokens += tokens_per_step
+        total_tokens += tokens_per_opt_step
         training_completed = True
-        epoch_loss += loss.item()
+
+        logs = micro_logs
+        micro_logs = {}
+
+        epoch_loss += logs.get('total', 0)
         epoch_ntp_loss += logs.get('ntp', 0)
         epoch_latent_loss += logs.get('latent', 0)
         epoch_kl_loss += logs.get('kl', 0)
         epoch_steps += 1
 
-        step_time = time.time() - step_start
+        step_time = time.time() - t_accum_start
+        t_accum_start = time.time()
         step_times.append(step_time)
         if len(step_times) > 100:
             step_times.pop(0)
         avg_step_time = sum(step_times) / len(step_times)
-        tokens_per_sec = tokens_per_step / avg_step_time if avg_step_time > 0 else 0
+        tokens_per_sec = tokens_per_opt_step / avg_step_time if avg_step_time > 0 else 0
 
         # ── Logging ──
         if global_step % args.log_every == 0:

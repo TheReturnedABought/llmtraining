@@ -3,11 +3,56 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+# SDPA backend selection (PyTorch 2.3+)
+# FLASH_ATTENTION  — fastest, O(T) memory, but only works with is_causal=True / no mask
+# EFFICIENT_ATTENTION — O(T) memory, handles arbitrary boolean masks (SWA)
+# MATH             — fallback, materialises full O(T²) attention matrix
+try:
+    from torch.nn.attention import SDPBackend, sdpa_kernel as _sdpa_kernel
+
+    _HAS_EFFICIENT_ATTN = True
+except ImportError:
+    _HAS_EFFICIENT_ATTN = False
+
+
+class RMSNorm(nn.Module):
+    """RMS Normalisation — faster than LayerNorm (no mean subtraction).
+    Used in LLaMA, Mistral, Gemma, DeepSeek-V3."""
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        rms = x.pow(2).mean(-1, keepdim=True).add(self.eps).rsqrt()
+        return x * rms * self.weight
+
+
+class SwiGLUFFN(nn.Module):
+    """SwiGLU feed-forward network — same param count as 4× GELU MLP but
+    gated, which improves gradient flow and tensor-core utilisation.
+    Used in LLaMA, Mistral, PaLM, DeepSeek-V3.
+    hidden_dim ≈ 8d/3, rounded to the nearest multiple of 64."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        hidden = int(dim * 8 / 3)
+        hidden = (hidden + 63) // 64 * 64  # align to 64 for GPU efficiency
+        self.gate = nn.Linear(dim, hidden, bias=False)
+        self.val = nn.Linear(dim, hidden, bias=False)
+        self.proj = nn.Linear(hidden, dim, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.proj(F.silu(self.gate(x)) * self.val(x))
+
 
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=2048):
         super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        # Base 1_000_000 (Qwen3 style) — higher than LLaMA-3's 500k to compensate
+        # for QK-Norm suppressing attention entropy at long contexts.
+        inv_freq = 1.0 / (1_000_000 ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq)
         self.max_seq_len = max_seq_len
         self._build_cache(max_seq_len)
@@ -36,19 +81,38 @@ class RotaryEmbedding(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, window_size: int | None = None):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.head_dim = config.n_embd // config.n_head
+        self.window_size = window_size  # None = full causal attention
 
         self.q_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         self.k_proj = nn.Linear(config.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
 
+        # QK-Norm (Qwen3): per-head RMSNorm on Q and K before RoPE.
+        # Prevents dot-product overflow in BF16 and attention entropy collapse.
+        # Especially important with SWA where short windows create sharp distributions.
+        self.q_norm = RMSNorm(self.head_dim)
+        self.k_norm = RMSNorm(self.head_dim)
+
         self.rotary = RotaryEmbedding(self.head_dim)
+
+        # Pre-build the SWA mask once at init (lives on GPU via register_buffer).
+        # Global layers (window_size=None) use is_causal=True — no mask needed.
+        if self.window_size is not None:
+            self._build_mask(config.block_size)
+
+    def _build_mask(self, T: int) -> None:
+        """Build and cache [1,1,T,T] SWA boolean mask (True=attend)."""
+        idx = torch.arange(T)
+        dist = idx.unsqueeze(1) - idx.unsqueeze(0)
+        mask = ((dist >= 0) & (dist < self.window_size)).unsqueeze(0).unsqueeze(0)
+        self.register_buffer('_attn_mask', mask, persistent=False)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -57,34 +121,56 @@ class CausalSelfAttention(nn.Module):
         k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
 
+        # QK-Norm: normalise per head before RoPE (Qwen3 pattern)
+        q = self.q_norm(q)  # [B, n_head,    T, head_dim]
+        k = self.k_norm(k)  # [B, n_kv_head, T, head_dim]
+
         q, k = self.rotary(q, k)
 
-        # GQA: repeat KV heads
+        # GQA: repeat KV heads to match query head count
         if self.n_kv_head != self.n_head:
             k = k.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
             v = v.repeat_interleave(self.n_head // self.n_kv_head, dim=1)
 
-        # Flash attention or standard
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        if self.window_size is None:
+            # ── Global attention ────────────────────────────────────────────────
+            # is_causal=True lets PyTorch dispatch to Flash Attention-2 on Ampere+.
+            # No attention matrix ever materialised — O(T) memory.
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        else:
+            # ── Sliding-window attention ──────────────────────────────────────
+            # Lazy rebuild if sequence length changes (never during fixed training).
+            if T != self._attn_mask.shape[-1]:
+                self._build_mask(T)
+                self._attn_mask = self._attn_mask.to(x.device)
+            # EFFICIENT_ATTENTION backend: O(T) chunked memory, handles custom masks.
+            # Falls back to math backend (O(T²)) on CPU or FP32 — safe at eval time.
+            if (_HAS_EFFICIENT_ATTN
+                    and q.is_cuda
+                    and q.dtype in (torch.float16, torch.bfloat16)):
+                with _sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                    y = F.scaled_dot_product_attention(q, k, v, attn_mask=self._attn_mask)
+            else:
+                y = F.scaled_dot_product_attention(q, k, v, attn_mask=self._attn_mask)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         return self.o_proj(y)
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, window_size: int | None = None):
         super().__init__()
-        self.attn = CausalSelfAttention(config)
-        self.mlp = nn.Sequential(
-            nn.Linear(config.n_embd, 4 * config.n_embd, bias=False),
-            nn.GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd, bias=False),
-        )
-        self.ln1 = nn.LayerNorm(config.n_embd)
-        self.ln2 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config, window_size=window_size)
+        self.mlp = SwiGLUFFN(config.n_embd)
+
+        # Parallel architecture (PaLM/GPT-J style):
+        # Attention and MLP share a single pre-norm.
+        self.ln = RMSNorm(config.n_embd)
 
     def forward(self, x):
-        x = x + self.attn(self.ln1(x))
-        x = x + self.mlp(self.ln2(x))
+        # Normalise once, compute branches concurrently, add to residual
+        nx = self.ln(x)
+        x = x + self.attn(nx) + self.mlp(nx)
         return x
 
 
@@ -94,7 +180,7 @@ class Tokenizer(nn.Module):
     def __init__(self, vocab_size, n_embd):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, n_embd)
-        self.ln = nn.LayerNorm(n_embd)
+        self.ln = RMSNorm(n_embd)
 
     def forward(self, idx):
         return self.ln(self.embed(idx))
@@ -231,16 +317,26 @@ class WorldModel(nn.Module):
         super().__init__()
         self.config = config
         self.tok = Tokenizer(config.vocab_size, config.n_embd)
+
+        # Hybrid attention: local SWA layers + 1 global layer at the end
+        # (Mistral / BLT pattern — best for byte-level local context)
+        swa_w = getattr(config, 'swa_window', 256)
         self.blocks = nn.ModuleList([
-            TransformerBlock(config) for _ in range(config.n_layer)
+            TransformerBlock(
+                config,
+                window_size=None if i == config.n_layer - 1 else swa_w
+            )
+            for i in range(config.n_layer)
         ])
-        self.ln_f = nn.LayerNorm(config.n_embd)
+        self.ln_f = RMSNorm(config.n_embd)
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
         # Tie weights
         self.lm_head.weight = self.tok.embed.weight
 
         self.dynamics = LatentDynamics(config)
+
+        self.use_checkpoint = False  # set via model.use_checkpoint = True
 
         self.apply(self._init_weights)
 
@@ -264,9 +360,12 @@ class WorldModel(nn.Module):
         # Combine with original features for transformer input
         x = x + lambda_h * latent_features
 
-        # Transformer blocks
+        # Transformer blocks (with optional gradient checkpointing)
         for block in self.blocks:
-            x = block(x)
+            if self.use_checkpoint:
+                x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
+            else:
+                x = block(x)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -279,7 +378,8 @@ class WorldModel(nn.Module):
             ntp_loss = F.cross_entropy(
                 logits[:, :-1].contiguous().view(-1, logits.size(-1)),
                 targets[:, 1:].contiguous().view(-1),
-                ignore_index=-1
+                ignore_index=-1,
+                reduction='mean'
             )
 
             # Apply free bits to KL (prevent complete collapse)
