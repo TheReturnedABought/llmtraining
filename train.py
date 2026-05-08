@@ -5,6 +5,7 @@ import argparse
 import signal
 import sys
 import math
+import traceback
 from pathlib import Path
 from datetime import datetime
 from model import WorldModel
@@ -82,7 +83,28 @@ opt = torch.optim.AdamW(
     weight_decay=args.weight_decay
 )
 
-train_loader, val_loader = get_loaders(cfg.block_size, args.batch_size, num_workers=args.num_workers)
+print("📚 Preparing datasets and data loaders...", flush=True)
+try:
+    train_loader, val_loader = get_loaders(cfg.block_size, args.batch_size, num_workers=args.num_workers)
+    train_batches = len(train_loader)
+    val_batches = len(val_loader)
+except BaseException as e:
+    print(f"FAILED to build data loaders: {e}", flush=True)
+    print("   Make sure dependencies are installed: pip install torch datasets numpy")
+    print("   If cache may be corrupted, delete: data_cache_wikipedia_en.bin and data_cache_wikipedia_en.bin.len")
+    traceback.print_exc()
+    sys.exit(1)
+
+print(f"✅ Data loaders ready | train batches: {train_batches} | val batches: {val_batches}", flush=True)
+
+if train_batches == 0:
+    print("❌ Training dataset produced zero batches.")
+    print("   Check your cached dataset file and block size settings.")
+    print("   Try deleting cache files and rerun: data_cache_wikipedia_en.bin and data_cache_wikipedia_en.bin.len")
+    sys.exit(1)
+
+if val_batches == 0:
+    print("⚠️  Validation dataset produced zero batches. Evaluation checkpoints may be skipped.")
 
 # ─────────────────────────────
 # Initialization Logging
@@ -134,8 +156,8 @@ print(f"   ├─ Eval batches : {args.eval_batches if args.eval_batches else 'f
 print(f"   ├─ Num workers  : {args.num_workers}")
 print(f"   └─ Sample tokens: {args.sample_tokens}")
 print(f"\n📊 Dataset:")
-print(f"   ├─ Train batches: {len(train_loader)}")
-print(f"   ├─ Val batches  : {len(val_loader)}")
+print(f"   ├─ Train batches: {train_batches}")
+print(f"   ├─ Val batches  : {val_batches}")
 print(f"   └─ Tokens/batch : {args.batch_size * cfg.block_size:,}")
 print(f"\n💾 Checkpoint Strategy: Every 10% progress + Best models only")
 print("=" * 60 + "\n")
