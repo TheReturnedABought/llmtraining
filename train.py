@@ -54,7 +54,6 @@ parser.add_argument("--grad_clip", type=float, default=1.0)
 parser.add_argument("--weight_decay", type=float, default=0.01)
 parser.add_argument("--beta1", type=float, default=0.9)
 parser.add_argument("--beta2", type=float, default=0.95)
-parser.add_argument("--num_workers", type=int, default=0, help="DataLoader workers")
 args = parser.parse_args()
 
 # ─────────────────────────────
@@ -82,7 +81,7 @@ opt = torch.optim.AdamW(
     weight_decay=args.weight_decay
 )
 
-train_loader, val_loader = get_loaders(cfg.block_size, args.batch_size, num_workers=args.num_workers)
+train_loader, val_loader = get_loaders(cfg.block_size, args.batch_size)
 
 # ─────────────────────────────
 # Initialization Logging
@@ -131,7 +130,6 @@ print(f"   ├─ KL warmup    : {args.kl_warmup} steps")
 print(f"   ├─ Weight decay : {args.weight_decay}")
 print(f"   ├─ Grad clip    : {args.grad_clip}")
 print(f"   ├─ Eval batches : {args.eval_batches if args.eval_batches else 'full'}")
-print(f"   ├─ Num workers  : {args.num_workers}")
 print(f"   └─ Sample tokens: {args.sample_tokens}")
 print(f"\n📊 Dataset:")
 print(f"   ├─ Train batches: {len(train_loader)}")
@@ -258,13 +256,8 @@ if args.resume is not None:
 
     global_step = ckpt.get("global_step", 0)
     best_val_loss = ckpt.get("best_val_loss", float('inf'))
-    best_step = ckpt.get("best_step")
-    if best_step is None or (best_step == 0 and global_step > 0 and best_val_loss != float('inf')):
-        best_step = global_step if best_val_loss != float('inf') else 0
-
-    current_epoch = ckpt.get("epoch")
-    if current_epoch is None:
-        current_epoch = global_step // max(len(train_loader), 1)
+    best_step = ckpt.get("best_step", 0)
+    current_epoch = ckpt.get("epoch", 0)
 
     print(f"✅ Resumed — Step {global_step}, Epoch {current_epoch}")
     print(f"📉 Best val loss: {best_val_loss:.4f} (at step {best_step})")
@@ -290,10 +283,6 @@ if not args.resume and global_step == 0:
         "model": model.state_dict(),
         "global_step": 0,
         "best_val_loss": best_val_loss,
-        "best_step": best_step,
-        "epoch": current_epoch,
-        "optimizer": opt.state_dict(),
-        "args": vars(args),
         "config": {
             "vocab_size": cfg.vocab_size,
             "block_size": cfg.block_size,
@@ -413,10 +402,6 @@ def save_checkpoint(step, epoch, is_best=False, is_progress=False):
             "model": model.state_dict(),
             "global_step": step,
             "best_val_loss": best_val_loss,
-            "best_step": best_step,
-            "epoch": epoch,
-            "optimizer": opt.state_dict(),
-            "args": vars(args),
             "config": {
                 "vocab_size": cfg.vocab_size,
                 "block_size": cfg.block_size,
@@ -617,6 +602,9 @@ for epoch in range(current_epoch, args.epochs):
 
             if is_best or is_progress:
                 save_checkpoint(global_step, epoch + 1, is_best=is_best, is_progress=is_progress)
+            elif is_best:
+                # If only best (no progress checkpoint needed), still save best
+                save_checkpoint(global_step, epoch + 1, is_best=True)
 
             print()  # Extra newline for readability
 
@@ -664,19 +652,15 @@ best_path = checkpoint_dir / "best.pt"
 if best_path.exists():
     print(f"🏆 Best model saved to: {best_path}")
 
-progress_ckpts = sorted(checkpoint_dir.glob("checkpoint_*.pt"))
-if progress_ckpts:
-    print("\n📋 Progress checkpoints saved:")
-    for f in progress_ckpts:
-        print(f"   - {f.name}")
+print("\n📋 Progress checkpoints saved:")
+for f in sorted(checkpoint_dir.glob("checkpoint_*.pt")):
+    print(f"   - {f.name}")
 
 # Save final checkpoint if training completed and at a milestone
 if training_completed and global_step > 0 and should_save_progress_checkpoint(min(global_step, args.steps)):
     final_step = min(global_step, args.steps)
-    final_name = checkpoint_dir / f"checkpoint_{final_step:06d}.pt"
-    if not final_name.exists():
-        save_checkpoint(final_step, current_epoch, is_progress=True)
-        print(f"\n💾 Final checkpoint saved at step {final_step}")
+    save_checkpoint(final_step, current_epoch, is_progress=True)
+    print(f"\n💾 Final checkpoint saved at step {final_step}")
 
 if args.wandb:
     wandb.finish()
