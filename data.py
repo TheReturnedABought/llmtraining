@@ -1,17 +1,15 @@
-"""
-data.py — downloads Wikipedia parquet files directly via huggingface_hub + pyarrow.
-No 'datasets' library required. Both huggingface_hub and pyarrow are already installed.
-"""
-import os
+"""Utilities for building and loading a byte-level Wikipedia training cache."""
+
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-REPO_ID     = "wikimedia/wikipedia"
+REPO_ID = "wikimedia/wikipedia"
 DATA_PREFIX = "20231101.en/"
-CACHE_PATH  = "data_cache_wikipedia_en.bin"
+CACHE_PATH = "data_cache_wikipedia_en.bin"
 FLUSH_BYTES = 8 * 1024 * 1024  # 8 MB
 
 
@@ -27,6 +25,19 @@ def _meta_path(p: str) -> Path:
     return Path(p).with_suffix(Path(p).suffix + ".len")
 
 
+def _die(msg: str):
+    raise RuntimeError(msg)
+
+
+def _wipe(cache_path: str):
+    cache_file = Path(cache_path)
+    meta_file = _meta_path(cache_path)
+    if cache_file.exists():
+        cache_file.unlink()
+    if meta_file.exists():
+        meta_file.unlink()
+
+
 def _log(msg: str):
     try:
         print(msg, flush=True)
@@ -37,51 +48,47 @@ def _log(msg: str):
 def _build_cache(cache_path: str):
     _wipe(cache_path)
 
-    # ── imports (both confirmed installed) ───────────────────────────────────
     try:
-        from huggingface_hub import list_repo_files, hf_hub_download
-    except ImportError:
-        _die("huggingface_hub not found. Run: pip install huggingface_hub")
+        from huggingface_hub import hf_hub_download, list_repo_files
+    except ImportError as exc:
+        _die(f"huggingface_hub not found. Run: pip install huggingface_hub ({exc})")
 
     try:
         import pyarrow.parquet as pq
-    except ImportError:
-        _die("pyarrow not found. Run: pip install pyarrow")
+    except ImportError as exc:
+        _die(f"pyarrow not found. Run: pip install pyarrow ({exc})")
 
-    # ── list parquet files ───────────────────────────────────────────────────
     _log(f"[data] Listing parquet files in {REPO_ID} ...")
     try:
         all_files = list(list_repo_files(REPO_ID, repo_type="dataset"))
-    except Exception as e:
-        _die(f"Could not list repo files: {e}")
+    except Exception as exc:
+        _die(f"Could not list repo files: {exc}")
 
     parquet_files = sorted(
-        f for f in all_files
-        if f.startswith(DATA_PREFIX) and f.endswith(".parquet")
+        f for f in all_files if f.startswith(DATA_PREFIX) and f.endswith(".parquet")
     )
 
     if not parquet_files:
         _die(f"No parquet files found under '{DATA_PREFIX}'. Check the dataset path.")
 
     _log(f"[data] Found {len(parquet_files)} parquet files. Starting download ...")
-    _log( "[data] Files are cached by huggingface_hub (~20 GB total).")
+    _log("[data] Files are cached by huggingface_hub (~20 GB total).")
 
-    # ── download + encode ────────────────────────────────────────────────────
     total_bytes = 0
-    buffer      = bytearray()
+    buffer = bytearray()
 
     with open(cache_path, "wb") as out:
         for i, filename in enumerate(parquet_files):
-            _log(f"[data] [{i+1}/{len(parquet_files)}] {filename}")
+            _log(f"[data] [{i + 1}/{len(parquet_files)}] {filename}")
             try:
                 local = hf_hub_download(
                     repo_id=REPO_ID,
                     filename=filename,
                     repo_type="dataset",
                 )
-            except Exception as e:
+            except Exception as exc:
                 _wipe(cache_path)
-                _die(f"Download failed for {filename}: {e}")
+                _die(f"Download failed for {filename}: {exc}")
 
             try:
                 table = pq.read_table(local, columns=["text"])
@@ -91,9 +98,9 @@ def _build_cache(cache_path: str):
                         out.write(buffer)
                         total_bytes += len(buffer)
                         buffer.clear()
-            except Exception as e:
+            except Exception as exc:
                 _wipe(cache_path)
-                _die(f"Failed reading {filename}: {e}")
+                _die(f"Failed reading {filename}: {exc}")
 
         if buffer:
             out.write(buffer)
@@ -103,14 +110,17 @@ def _build_cache(cache_path: str):
         _wipe(cache_path)
         _die("Wrote 0 bytes. Something went wrong.")
 
+    _meta_path(cache_path).write_text(str(total_bytes), encoding="utf-8")
+
+
 @lru_cache(maxsize=4)
-def _load_token_data(cache_path: str):
+def _load_data(cache_path: str):
     cache_file = Path(cache_path).resolve()
-    len_file = _metadata_path(cache_path)
+    len_file = _meta_path(str(cache_file))
 
     if not cache_file.exists() or not len_file.exists():
         print(f"📥 Cache not found. Building dataset cache at {cache_file}...", flush=True)
-        _build_cache_streaming(str(cache_file))
+        _build_cache(str(cache_file))
 
     total_bytes = int(len_file.read_text(encoding="utf-8").strip())
     if total_bytes <= 0:
@@ -120,10 +130,9 @@ def _load_token_data(cache_path: str):
 
 
 class WikiCharDataset(Dataset):
-    def __init__(self, split="train", block_size=256, val_frac=0.05,
-                 cache_path=CACHE_PATH):
+    def __init__(self, split="train", block_size=256, val_frac=0.05, cache_path=CACHE_PATH):
         self.block_size = block_size
-        data  = _load_data(cache_path)
+        data = _load_data(cache_path)
         n_val = int(len(data) * val_frac)
         self.data = data[:n_val] if split == "val" else data[n_val:]
 
@@ -131,25 +140,34 @@ class WikiCharDataset(Dataset):
         return max(0, len(self.data) - self.block_size - 1)
 
     def __getitem__(self, idx):
-        chunk = self.data[idx : idx + self.block_size]
-        x = torch.tensor(chunk, dtype=torch.long)
-        y = x.clone()
+        chunk = self.data[idx : idx + self.block_size + 1]
+        x = torch.tensor(chunk[:-1], dtype=torch.long)
+        y = torch.tensor(chunk[1:], dtype=torch.long)
         return x, y
 
 
 def get_loaders(block_size=256, batch_size=64, num_workers=0):
-    train = WikiCharDataset("train", block_size)
-    val = WikiCharDataset("val", block_size)
+    train_ds = WikiCharDataset("train", block_size)
+    val_ds = WikiCharDataset("val", block_size)
 
-    if len(train) == 0:
+    if len(train_ds) == 0:
         raise ValueError(
             "Training split has zero samples after block sizing. "
             "Cache may be too small/corrupted for the configured block_size."
         )
 
     return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                   num_workers=num_workers, pin_memory=(num_workers == 0)),
-        DataLoader(val_ds,   batch_size=batch_size,
-                   num_workers=num_workers, pin_memory=(num_workers == 0)),
+        DataLoader(
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=(num_workers == 0),
+        ),
+        DataLoader(
+            val_ds,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            pin_memory=(num_workers == 0),
+        ),
     )
