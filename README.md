@@ -201,5 +201,6 @@ python generate.py \
   - Ensure you are in the project directory and using the same Python env where dependencies were installed.
 - **Command appears to do nothing**
   - Run unbuffered logging: `python -u train.py`.
+  - On first run, cache creation can take time; you should now see `📥 Cache not found. Building dataset cache ...` while it streams Wikipedia data.
   - You should see startup logs like `Preparing datasets` and `Initialization Report` before training begins.
 

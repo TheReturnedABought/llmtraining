@@ -54,9 +54,13 @@ def _load_token_data(cache_path: str):
     len_file = _metadata_path(cache_path)
 
     if not cache_file.exists() or not len_file.exists():
+        print(f"📥 Cache not found. Building dataset cache at {cache_file}...", flush=True)
         _build_cache_streaming(cache_path)
 
     total_bytes = int(len_file.read_text(encoding="utf-8").strip())
+    if total_bytes <= 0:
+        raise ValueError(f"Cache metadata indicates zero bytes: {len_file}")
+
     return np.memmap(cache_file, dtype=np.uint8, mode="r", shape=(total_bytes,))
 
 
@@ -68,7 +72,7 @@ class WikiCharDataset(Dataset):
         self.data = data[:n_val] if split == "val" else data[n_val:]
 
     def __len__(self):
-        return len(self.data) - self.block_size - 1
+        return max(0, len(self.data) - self.block_size - 1)
 
     def __getitem__(self, idx):
         chunk = self.data[idx : idx + self.block_size + 1]
@@ -80,6 +84,12 @@ class WikiCharDataset(Dataset):
 def get_loaders(block_size=256, batch_size=64, num_workers=0):
     train = WikiCharDataset("train", block_size)
     val = WikiCharDataset("val", block_size)
+
+    if len(train) == 0:
+        raise ValueError(
+            "Training split has zero samples after block sizing. "
+            "Cache may be too small/corrupted for the configured block_size."
+        )
 
     return (
         DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True),
