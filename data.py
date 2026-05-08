@@ -26,12 +26,33 @@ def _metadata_path(cache_path: str) -> Path:
 def _build_cache_streaming(cache_path: str):
     from datasets import load_dataset
 
-    ds = load_dataset(WIKIPEDIA_DATASET, WIKIPEDIA_EN_SUBSET, split="train", streaming=True)
+    cache_file = Path(cache_path).resolve()
+    project_cache_root = cache_file.parent / ".hf_cache"
+    datasets_cache = project_cache_root / "datasets"
+    hub_cache = project_cache_root / "hub"
+
+    project_cache_root.mkdir(parents=True, exist_ok=True)
+    datasets_cache.mkdir(parents=True, exist_ok=True)
+    hub_cache.mkdir(parents=True, exist_ok=True)
+
+    # Force HF artifacts into the project folder (important on Windows when C: is full).
+    # Use assignment (not setdefault) so prior shell/global env values cannot redirect to user-profile cache.
+    os.environ["HF_HOME"] = str(project_cache_root)
+    os.environ["HF_DATASETS_CACHE"] = str(datasets_cache)
+    os.environ["HF_HUB_CACHE"] = str(hub_cache)
+
+    ds = load_dataset(
+        WIKIPEDIA_DATASET,
+        WIKIPEDIA_EN_SUBSET,
+        split="train",
+        streaming=True,
+        cache_dir=str(datasets_cache),
+    )
 
     total_bytes = 0
     buffer = bytearray()
 
-    with open(cache_path, "wb") as f:
+    with open(cache_file, "wb") as f:
         for row in ds:
             text = row.get("text", "") + "\n"
             buffer.extend(text.encode("utf-8", errors="replace"))
@@ -50,13 +71,17 @@ def _build_cache_streaming(cache_path: str):
 
 @lru_cache(maxsize=4)
 def _load_token_data(cache_path: str):
-    cache_file = Path(cache_path)
+    cache_file = Path(cache_path).resolve()
     len_file = _metadata_path(cache_path)
 
     if not cache_file.exists() or not len_file.exists():
-        _build_cache_streaming(cache_path)
+        print(f"📥 Cache not found. Building dataset cache at {cache_file}...", flush=True)
+        _build_cache_streaming(str(cache_file))
 
     total_bytes = int(len_file.read_text(encoding="utf-8").strip())
+    if total_bytes <= 0:
+        raise ValueError(f"Cache metadata indicates zero bytes: {len_file}")
+
     return np.memmap(cache_file, dtype=np.uint8, mode="r", shape=(total_bytes,))
 
 
@@ -68,7 +93,7 @@ class WikiCharDataset(Dataset):
         self.data = data[:n_val] if split == "val" else data[n_val:]
 
     def __len__(self):
-        return len(self.data) - self.block_size - 1
+        return max(0, len(self.data) - self.block_size - 1)
 
     def __getitem__(self, idx):
         chunk = self.data[idx : idx + self.block_size + 1]
@@ -80,6 +105,12 @@ class WikiCharDataset(Dataset):
 def get_loaders(block_size=256, batch_size=64, num_workers=0):
     train = WikiCharDataset("train", block_size)
     val = WikiCharDataset("val", block_size)
+
+    if len(train) == 0:
+        raise ValueError(
+            "Training split has zero samples after block sizing. "
+            "Cache may be too small/corrupted for the configured block_size."
+        )
 
     return (
         DataLoader(train, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True),
