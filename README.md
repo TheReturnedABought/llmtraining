@@ -108,6 +108,9 @@ python -c "import torch; print(f'PyTorch {torch.__version__}')"
 ```bash
 # 1) Start a fresh run (default: 100000 max steps, 10 max epochs)
 python train.py
+# Expected early output:
+# 📚 Preparing datasets and data loaders...
+# ✅ Data loaders ready | train batches: ... | val batches: ...
 
 # 2) Short sanity run
 python train.py --steps 500 --batch_size 16

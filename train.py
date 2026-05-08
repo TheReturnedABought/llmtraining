@@ -5,6 +5,7 @@ import argparse
 import signal
 import sys
 import math
+import traceback
 from pathlib import Path
 from datetime import datetime
 from model import WorldModel
@@ -83,7 +84,16 @@ opt = torch.optim.AdamW(
 )
 
 print("📚 Preparing datasets and data loaders...")
-train_loader, val_loader = get_loaders(cfg.block_size, args.batch_size, num_workers=args.num_workers)
+try:
+    train_loader, val_loader = get_loaders(cfg.block_size, args.batch_size, num_workers=args.num_workers)
+except Exception as e:
+    print(f"❌ Failed to build data loaders: {e}")
+    print("   Make sure dependencies are installed: pip install torch datasets numpy")
+    print("   If cache may be corrupted, delete: data_cache_wikipedia_en.bin and data_cache_wikipedia_en.bin.len")
+    traceback.print_exc()
+    sys.exit(1)
+
+print(f"✅ Data loaders ready | train batches: {len(train_loader)} | val batches: {len(val_loader)}")
 
 if len(train_loader) == 0:
     print("❌ Training dataset produced zero batches.")
