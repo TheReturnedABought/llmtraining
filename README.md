@@ -196,4 +196,7 @@ python generate.py \
   - Verify checkpoint exists under `--checkpoint_dir` (default: `checkpoints`).
 - **Command returns immediately in PowerShell**
   - Ensure you are in the project directory and using the same Python env where dependencies were installed.
+- **Command appears to do nothing**
+  - Run unbuffered logging: `python -u train.py`.
+  - You should see startup logs like `Preparing datasets` and `Initialization Report` before training begins.
 

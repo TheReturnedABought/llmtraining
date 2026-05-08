@@ -82,7 +82,17 @@ opt = torch.optim.AdamW(
     weight_decay=args.weight_decay
 )
 
+print("📚 Preparing datasets and data loaders...")
 train_loader, val_loader = get_loaders(cfg.block_size, args.batch_size, num_workers=args.num_workers)
+
+if len(train_loader) == 0:
+    print("❌ Training dataset produced zero batches.")
+    print("   Check your cached dataset file and block size settings.")
+    print("   Try deleting cache files and rerun: data_cache_wikipedia_en.bin and data_cache_wikipedia_en.bin.len")
+    sys.exit(1)
+
+if len(val_loader) == 0:
+    print("⚠️  Validation dataset produced zero batches. Evaluation checkpoints may be skipped.")
 
 # ─────────────────────────────
 # Initialization Logging
