@@ -202,5 +202,9 @@ python generate.py \
 - **Command appears to do nothing**
   - Run unbuffered logging: `python -u train.py`.
   - On first run, cache creation can take time; you should now see `📥 Cache not found. Building dataset cache ...` while it streams Wikipedia data.
+
+  - HuggingFace cache is forced to `./.hf_cache/` (`datasets/` + `hub/`) in the project folder, so runs from `E:` stay on `E:` instead of `C:`.
+  - Optional: set `HF_TOKEN` to avoid anonymous-rate-limit warnings during large downloads.
+
   - You should see startup logs like `Preparing datasets` and `Initialization Report` before training begins.
 

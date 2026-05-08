@@ -34,27 +34,6 @@ def _log(msg: str):
         print(msg.encode("ascii", errors="replace").decode("ascii"), flush=True)
 
 
-def _die(msg: str):
-    _log(f"[data] ERROR: {msg}")
-    os._exit(1)
-
-
-def _wipe(cache_path: str):
-    Path(cache_path).unlink(missing_ok=True)
-    _meta_path(cache_path).unlink(missing_ok=True)
-
-
-def _cache_valid(cache_path: str) -> bool:
-    cf = Path(cache_path)
-    mf = _meta_path(cache_path)
-    if not cf.exists() or not mf.exists():
-        return False
-    try:
-        return int(mf.read_text(encoding="utf-8").strip()) > 0 and cf.stat().st_size > 0
-    except Exception:
-        return False
-
-
 def _build_cache(cache_path: str):
     _wipe(cache_path)
 
@@ -124,16 +103,20 @@ def _build_cache(cache_path: str):
         _wipe(cache_path)
         _die("Wrote 0 bytes. Something went wrong.")
 
-    _meta_path(cache_path).write_text(str(total_bytes), encoding="utf-8")
-    _log(f"[data] Cache ready: {total_bytes / 1e9:.1f} GB -> {cache_path}")
+@lru_cache(maxsize=4)
+def _load_token_data(cache_path: str):
+    cache_file = Path(cache_path).resolve()
+    len_file = _metadata_path(cache_path)
 
+    if not cache_file.exists() or not len_file.exists():
+        print(f"📥 Cache not found. Building dataset cache at {cache_file}...", flush=True)
+        _build_cache_streaming(str(cache_file))
 
-def _load_data(cache_path: str) -> np.memmap:
-    if not _cache_valid(cache_path):
-        _log(f"[data] Cache missing or invalid. Building at {cache_path} ...")
-        _build_cache(cache_path)
-    total_bytes = int(_meta_path(cache_path).read_text(encoding="utf-8").strip())
-    return np.memmap(Path(cache_path), dtype=np.uint8, mode="r", shape=(total_bytes,))
+    total_bytes = int(len_file.read_text(encoding="utf-8").strip())
+    if total_bytes <= 0:
+        raise ValueError(f"Cache metadata indicates zero bytes: {len_file}")
+
+    return np.memmap(cache_file, dtype=np.uint8, mode="r", shape=(total_bytes,))
 
 
 class WikiCharDataset(Dataset):
@@ -145,7 +128,7 @@ class WikiCharDataset(Dataset):
         self.data = data[:n_val] if split == "val" else data[n_val:]
 
     def __len__(self):
-        return max(0, len(self.data) - self.block_size)
+        return max(0, len(self.data) - self.block_size - 1)
 
     def __getitem__(self, idx):
         chunk = self.data[idx : idx + self.block_size]
@@ -155,10 +138,15 @@ class WikiCharDataset(Dataset):
 
 
 def get_loaders(block_size=256, batch_size=64, num_workers=0):
-    train_ds = WikiCharDataset("train", block_size)
-    val_ds   = WikiCharDataset("val",   block_size)
-    if len(train_ds) == 0:
-        _die("Training split has zero samples. Delete cache files and rerun.")
+    train = WikiCharDataset("train", block_size)
+    val = WikiCharDataset("val", block_size)
+
+    if len(train) == 0:
+        raise ValueError(
+            "Training split has zero samples after block sizing. "
+            "Cache may be too small/corrupted for the configured block_size."
+        )
+
     return (
         DataLoader(train_ds, batch_size=batch_size, shuffle=True,
                    num_workers=num_workers, pin_memory=(num_workers == 0)),
